@@ -15,6 +15,8 @@ struct Downloader
 end
 
 const DEFAULT_DOWNLOADER = Ref{Union{Downloader, Nothing}}(nothing)
+const MAX_CONCURRENCY_DEFAULT_DOWNLOADER = 16
+const DEFAULT_DOWNLOADER_QUEUE = Base.Semaphore(MAX_CONCURRENCY_DEFAULT_DOWNLOADER)
 
 function default_downloader()::Downloader
     DEFAULT_DOWNLOADER[] isa Downloader && return DEFAULT_DOWNLOADER[]
@@ -45,28 +47,37 @@ function download(
     headers::Headers = Pair{String,String}[],
     downloader::Downloader = default_downloader(),
 )
+    if downloader === default_downloader()
+        Base.acquire(DEFAULT_DOWNLOADER_QUEUE)
+    end
     yield() # prevents deadlocks, shouldn't be necessary
-    arg_write(output) do io
-        easy = Easy()
-        set_url(easy, url)
-        for hdr in headers
-            hdr isa Pair{<:AbstractString, <:Union{AbstractString, Nothing}} ||
-                throw(ArgumentError("invalid header: $(repr(hdr))"))
-            add_header(easy, hdr)
+    try
+        arg_write(output) do io
+            easy = Easy()
+            set_url(easy, url)
+            for hdr in headers
+                hdr isa Pair{<:AbstractString, <:Union{AbstractString, Nothing}} ||
+                    throw(ArgumentError("invalid header: $(repr(hdr))"))
+                add_header(easy, hdr)
+            end
+            add_handle(downloader.multi, easy)
+            for buf in easy.buffers
+                write(io, buf)
+            end
+            remove_handle(downloader.multi, easy)
+            status = get_response_code(easy)
+            status == 200 && return
+            if easy.code == Curl.CURLE_OK
+                message = get_response_headers(easy)[1]
+            else
+                message = GC.@preserve easy unsafe_string(pointer(easy.errbuf))
+            end
+            error(message)
         end
-        add_handle(downloader.multi, easy)
-        for buf in easy.buffers
-            write(io, buf)
+    finally
+        if downloader === default_downloader()
+            Base.release(DEFAULT_DOWNLOADER_QUEUE)
         end
-        remove_handle(downloader.multi, easy)
-        status = get_response_code(easy)
-        status == 200 && return
-        if easy.code == Curl.CURLE_OK
-            message = get_response_headers(easy)[1]
-        else
-            message = GC.@preserve easy unsafe_string(pointer(easy.errbuf))
-        end
-        error(message)
     end
 end
 
